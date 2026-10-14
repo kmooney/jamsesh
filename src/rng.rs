@@ -55,6 +55,7 @@ impl Rng {
                 return i;
             }
         }
-        w.len() - 1
+        // Rounding left a sliver: take the last option that had any weight, never a zero one.
+        weights.iter().rposition(|&p| p > 0.0).unwrap_or(w.len() - 1)
     }
 }

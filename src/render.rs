@@ -3,18 +3,28 @@
 use crate::decide::{Decision, Role, Slot, notes_range};
 use crate::listener::Summary;
 use crate::rng::Rng;
-use crate::theory::Key;
+use crate::theory::{Chord, Key};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Msg {
     On(u8, u8),
     Off(u8),
+    /// MIDI expression (CC11): how loud sustained notes are, without re-attacking them.
+    Expression(u8),
 }
+
+/// Expression when nothing is shaping it (the MIDI default).
+const FULL_EXPRESSION: u8 = 127;
 
 /// The robot's voice. Remembers sustained pad/drone notes so they can ring across bars.
 #[derive(Default)]
 pub struct Robot {
     held: Vec<u8>,
+    /// Last expression sent (None: never set, so the synth's default).
+    expression: Option<u8>,
+    /// The octave shift the held pad was voiced for; a change re-voices it rather than
+    /// voice-leading back toward the old register.
+    pad_octave: i32,
 }
 
 pub struct BarInput<'a> {
@@ -40,17 +50,25 @@ impl Robot {
 
     pub fn render(&mut self, input: &BarInput, rng: &mut Rng) -> Vec<(f64, Msg)> {
         let d = input.decision;
-        if d.role == Role::Notes {
-            return self.render_slots(input);
+        if d.role == Role::Pad {
+            return self.render_pad(input);
+        }
+        // Only the pad shapes expression; everything else plays at full expression.
+        let mut out = Vec::new();
+        if self.expression.is_some_and(|e| e != FULL_EXPRESSION) {
+            out.push((input.bar_start, Msg::Expression(FULL_EXPRESSION)));
+            self.expression = Some(FULL_EXPRESSION);
+        }
+        if matches!(d.role, Role::Notes | Role::Chords) {
+            out.extend(self.render_slots(input));
+            return out;
         }
         let start = input.bar_start;
         let dyn_scale = (0.7 + input.human_vel / 127.0 * 0.5).clamp(0.7, 1.2);
         let vel = |extra: f64| ((30.0 + d.energy * 11.0 + extra) * dyn_scale).clamp(12.0, 110.0) as u8;
-        let mut out = Vec::new();
 
         // Sustained parts: keep ringing if nothing changed.
         let sustained = match d.role {
-            Role::Pad => Some(d.chord.open_voicing(if input.human_center >= 57.0 { 45 } else { 57 })),
             Role::Drone => {
                 let root = 36 + d.chord.root;
                 let root = if root > 43 { root - 12 } else { root };
@@ -60,7 +78,7 @@ impl Robot {
             _ => None,
         }
         .map(|notes| notes.into_iter().map(|n| transpose(n, input.octave)).collect::<Vec<_>>());
-        if sustained.as_ref() == Some(&self.held) {
+        if sustained.is_some() && sustained.as_ref() == Some(&self.held) {
             return out;
         }
         for &n in &self.held {
@@ -71,9 +89,9 @@ impl Robot {
         let fresh = out.len();
         let shifted_already = sustained.is_some();
         match d.role {
-            // Notes returned early above.
-            Role::Rest | Role::Notes => {}
-            Role::Pad | Role::Drone | Role::BassRoot => {
+            // Pad, notes and chords returned early above.
+            Role::Rest | Role::Notes | Role::Chords | Role::Pad => {}
+            Role::Drone | Role::BassRoot => {
                 let notes = sustained.unwrap_or_default();
                 for (i, &n) in notes.iter().enumerate() {
                     out.push((start + i as f64 * 0.08, Msg::On(n, vel(-6.0))));
@@ -91,23 +109,77 @@ impl Robot {
                 self.bass(input, rng, vel(10.0), &mut out)
             }
         }
-        // Pad/drone notes were shifted above; shift everything else generated this step.
+        // Drone notes were shifted above; shift everything else generated this step.
         if !shifted_already {
             for (_, m) in &mut out[fresh..] {
                 *m = match *m {
                     Msg::On(n, v) => Msg::On(transpose(n, input.octave), v),
                     Msg::Off(n) => Msg::Off(transpose(n, input.octave)),
+                    e => e,
                 };
             }
         }
         out
     }
 
-    /// Notes mode: one picked note or chord per beat. Whatever sounds rings until something
+    /// A sustained pad. A chord change is voice-led: shared notes keep ringing, the rest move to
+    /// the nearest voicing (in the pad's register), nothing is re-struck. Loudness follows the
+    /// planned energy through expression, ramped over up to two beats, so it swells and fades
+    /// with the human without new attacks.
+    fn render_pad(&mut self, input: &BarInput) -> Vec<(f64, Msg)> {
+        let d = input.decision;
+        let start = input.bar_start;
+        let mut out = Vec::new();
+
+        let target = (40.0 + d.energy * 25.0).clamp(20.0, 127.0) as u8;
+        match self.expression {
+            Some(from) if from.abs_diff(target) >= 3 => {
+                let span = input.beats.min(2.0);
+                for k in 1..=4u8 {
+                    let v = from as f64 + (target as f64 - from as f64) * k as f64 / 4.0;
+                    out.push((start + span * (k - 1) as f64 / 4.0, Msg::Expression(v.round() as u8)));
+                }
+                self.expression = Some(target);
+            }
+            Some(_) => {}
+            None => {
+                out.push((start, Msg::Expression(target)));
+                self.expression = Some(target);
+            }
+        }
+
+        let base: u8 = if input.human_center >= 57.0 { 45 } else { 57 };
+        let voicing = |low: u8| -> Vec<u8> { d.chord.open_voicing(low).into_iter().map(|n| transpose(n, input.octave)).collect() };
+        let home = voicing(base);
+        let notes = if self.held.is_empty() || self.pad_octave != input.octave {
+            home.clone()
+        } else {
+            voice_lead(&self.held, d.chord, &home)
+        };
+        self.pad_octave = input.octave;
+        if notes == self.held {
+            return out;
+        }
+        let dyn_scale = (0.7 + input.human_vel / 127.0 * 0.5).clamp(0.7, 1.2);
+        let vel = ((34.0 + d.energy * 10.0) * dyn_scale).clamp(12.0, 100.0) as u8;
+        // New notes first, old ones a moment later, so the change is legato.
+        for (i, &n) in notes.iter().filter(|n| !self.held.contains(n)).enumerate() {
+            out.push((start + i as f64 * 0.03, Msg::On(n, vel)));
+        }
+        for &n in self.held.iter().filter(|n| !notes.contains(n)) {
+            out.push((start + 0.12, Msg::Off(n)));
+        }
+        self.held = notes;
+        out
+    }
+
+    /// Notes and chords modes: one picked note or chord per beat. Whatever sounds rings until something
     /// else is picked (or a rest), even across windows.
     fn render_slots(&mut self, input: &BarInput) -> Vec<(f64, Msg)> {
         let (lo, _) = notes_range(input.human_center);
-        let vel = (38.0 + input.human_vel * 0.35).clamp(30.0, 100.0) as u8;
+        // Louder with the planned energy, scaled toward the human's dynamics like the other parts.
+        let dyn_scale = (0.7 + input.human_vel / 127.0 * 0.5).clamp(0.7, 1.2);
+        let vel = ((32.0 + input.decision.energy * 14.0) * dyn_scale).clamp(20.0, 110.0) as u8;
         let mut out = Vec::new();
         for (k, slot) in input.decision.slots.iter().enumerate() {
             let at = input.bar_start + k as f64;
@@ -279,6 +351,56 @@ impl Robot {
     }
 }
 
+/// Move each ringing voice to a note of `chord`, trying every way of giving the voices the
+/// chord's tones and keeping the one with the least total movement. Small penalties keep the
+/// root in the bass and the pad near its home register, so it doesn't creep up or down.
+fn voice_lead(held: &[u8], chord: Chord, home: &[u8]) -> Vec<u8> {
+    let mut pcs = chord.pcs();
+    // As many tones as voices: drop the fifth first (then the ninth), or double the root.
+    while pcs.len() > held.len() {
+        let fifth = (chord.root + 7) % 12;
+        let drop = pcs.iter().position(|&p| p == fifth && p != chord.root).unwrap_or(pcs.len() - 1);
+        pcs.remove(drop);
+    }
+    while pcs.len() < held.len() {
+        pcs.push(chord.root % 12);
+    }
+    let nearest = |from: u8, pc: u8| -> u8 {
+        (from.saturating_sub(6)..=from.saturating_add(6)).filter(|n| n % 12 == pc).min_by_key(|n| n.abs_diff(from)).unwrap_or(from)
+    };
+    let home_mean = home.iter().map(|&n| n as i32).sum::<i32>() / home.len().max(1) as i32;
+    let mut best: Option<(i32, Vec<u8>)> = None;
+    for perm in permutations(&pcs) {
+        let mut notes: Vec<u8> = held.iter().zip(&perm).map(|(&h, &pc)| nearest(h, pc)).collect();
+        notes.sort_unstable();
+        let moves: i32 = held.iter().zip(&perm).map(|(&h, &pc)| nearest(h, pc).abs_diff(h) as i32).sum();
+        let unison = notes.windows(2).filter(|w| w[0] == w[1]).count() as i32 * 12;
+        let inversion = if notes[0] % 12 == chord.root % 12 { 0 } else { 3 };
+        let mean = notes.iter().map(|&n| n as i32).sum::<i32>() / notes.len() as i32;
+        let cost = moves + unison + inversion + (mean - home_mean).abs() / 2;
+        if best.as_ref().is_none_or(|(c, _)| cost < *c) {
+            best = Some((cost, notes));
+        }
+    }
+    best.map(|(_, n)| n).unwrap_or_else(|| home.to_vec())
+}
+
+fn permutations(items: &[u8]) -> Vec<Vec<u8>> {
+    if items.len() <= 1 {
+        return vec![items.to_vec()];
+    }
+    let mut out = Vec::new();
+    for i in 0..items.len() {
+        let mut rest = items.to_vec();
+        let first = rest.remove(i);
+        for mut p in permutations(&rest) {
+            p.insert(0, first);
+            out.push(p);
+        }
+    }
+    out
+}
+
 fn transpose(note: u8, octaves: i32) -> u8 {
     let mut n = note as i32 + 12 * octaves;
     while n > 127 {
@@ -324,7 +446,7 @@ mod tests {
     use crate::theory::{Chord, Mode, Quality};
 
     fn decision(role: Role, energy: f64) -> Decision {
-        Decision { role, chord: Chord { root: 5, quality: Quality::Maj7 }, energy, slots: Vec::new(), note: String::new() }
+        Decision { role, chord: Chord { root: 5, quality: Quality::Maj7 }, energy, slots: Vec::new(), note: String::new(), perception: None }
     }
 
     fn input<'a>(d: &'a Decision, bar_start: f64) -> BarInput<'a> {
@@ -394,6 +516,61 @@ mod tests {
         let evs = r.render(&input(&d, 4.0), &mut rng);
         assert_eq!(evs.iter().filter(|(b, m)| *b == 4.0 && matches!(m, Msg::Off(_))).count(), c.open_voicing(48).len());
         assert!(r.held().is_empty());
+    }
+
+    #[test]
+    fn pad_voice_leads_and_swells_without_restriking() {
+        let mut r = Robot::default();
+        let mut rng = Rng::from_time();
+        let ons = |e: &[(f64, Msg)]| e.iter().filter(|(_, m)| matches!(m, Msg::On(..))).count();
+        let offs = |e: &[(f64, Msg)]| e.iter().filter(|(_, m)| matches!(m, Msg::Off(_))).count();
+        let expression = |e: &[(f64, Msg)]| e.iter().filter_map(|(_, m)| if let Msg::Expression(v) = m { Some(*v) } else { None }).last();
+
+        let mut d = decision(Role::Pad, 1.0);
+        d.chord = Chord { root: 0, quality: Quality::Maj7 };
+        let first = r.render(&input(&d, 0.0), &mut rng);
+        assert_eq!(ons(&first), 4);
+        let c = r.held().to_vec();
+
+        // Cmaj7 -> Am7 shares C, E and G: only the changed voice moves, nothing is re-struck.
+        d.chord = Chord { root: 9, quality: Quality::Min7 };
+        let change = r.render(&input(&d, 4.0), &mut rng);
+        let kept = r.held().iter().filter(|n| c.contains(n)).count();
+        assert!(kept >= 2, "shared notes keep ringing: {c:?} -> {:?}", r.held());
+        assert_eq!(ons(&change), 4 - kept);
+        assert_eq!(offs(&change), c.len() - kept);
+        assert!(change.iter().all(|(_, m)| !matches!(m, Msg::On(n, _) if c.contains(n))), "no re-attack");
+
+        // Same chord, more energy: no notes, just expression up.
+        let before = expression(&first).unwrap();
+        d.energy = 2.5;
+        let swell = r.render(&input(&d, 8.0), &mut rng);
+        assert_eq!(ons(&swell) + offs(&swell), 0);
+        assert!(expression(&swell).unwrap() > before);
+
+        // Another part afterwards gets full expression back.
+        let bass = decision(Role::BassPulse, 1.0);
+        assert_eq!(expression(&r.render(&input(&bass, 12.0), &mut rng)), Some(FULL_EXPRESSION));
+    }
+
+    #[test]
+    fn pad_stays_in_its_register_over_a_long_progression() {
+        let mut r = Robot::default();
+        let mut rng = Rng::from_time();
+        let mut d = decision(Role::Pad, 1.0);
+        let chords = [(0, Quality::Maj7), (9, Quality::Min7), (5, Quality::Maj7), (7, Quality::Dom7), (2, Quality::Min7), (4, Quality::Min7)];
+        let mut means = Vec::new();
+        for i in 0..60 {
+            let (root, quality) = chords[(i * 5) % chords.len()];
+            d.chord = Chord { root, quality };
+            r.render(&input(&d, i as f64 * 4.0), &mut rng);
+            let held = r.held();
+            assert!(held.iter().collect::<std::collections::HashSet<_>>().len() == held.len(), "no unisons: {held:?}");
+            assert!(held.iter().all(|&n| d.chord.pcs().contains(&(n % 12))), "only chord tones: {held:?}");
+            means.push(held.iter().map(|&n| n as f64).sum::<f64>() / held.len() as f64);
+        }
+        let (lo, hi) = means.iter().fold((f64::MAX, f64::MIN), |(a, b), &m| (a.min(m), b.max(m)));
+        assert!(hi - lo <= 9.0, "register wandered from {lo} to {hi}");
     }
 
     #[test]

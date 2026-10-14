@@ -145,6 +145,10 @@ impl Out {
                 self.send(&[0x90 | ch, n, v.clamp(1, 127)]);
                 true
             }
+            Msg::Expression(v) => {
+                self.send(&[0xB0 | ch, 11, v.min(127)]);
+                true
+            }
             Msg::Off(n) => {
                 let n = n.min(127);
                 let a = &mut self.robot_active[n as usize];
@@ -178,6 +182,8 @@ impl Out {
             }
         }
         self.robot_active = [0; 128];
+        // The pad may have turned expression down; leave the synth at its default.
+        self.send(&[0xB0 | self.robot_ch, 11, 127]);
         for ch in [self.human_ch, self.robot_ch, self.click_ch] {
             self.send(&[0xB0 | ch, 64, 0]); // sustain off
             self.send(&[0xB0 | ch, 123, 0]); // all notes off

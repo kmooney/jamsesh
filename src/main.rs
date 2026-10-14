@@ -6,7 +6,11 @@ mod jev;
 mod jev_view;
 mod listener;
 mod midi_io;
+mod progression;
 mod render;
+mod respond;
+#[cfg(test)]
+mod responsiveness;
 mod rng;
 mod theory;
 mod viz;
@@ -81,7 +85,7 @@ struct JamArgs {
     /// How many past steps (yours and the robot's) to describe to Jev.
     #[arg(long, default_value_t = 8)]
     history: usize,
-    /// What the robot plays: ambient textures, or bass lines.
+    /// What the robot plays: ambient textures, bass lines, Jev-picked notes or chords, or a sustained pad.
     #[arg(short, long, value_enum, default_value_t = decide::Part::Ambient)]
     part: decide::Part,
     /// Shift the robot up or down this many octaves (-3..3); change live with [ and ].

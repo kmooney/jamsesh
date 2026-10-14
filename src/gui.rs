@@ -1,5 +1,5 @@
 //! Bevy window: two keyboards (you and the robot) with a tracker-style roll scrolling
-//! downward beneath each, and buttons for tempo, robot octave and click.
+//! downward beneath each, and buttons for tempo, robot octave, temperature and click.
 //!
 //! Everything dynamic is drawn from pooled sprites/texts re-laid out every frame from the
 //! shared jam state, so the jam thread never waits on rendering.
@@ -138,6 +138,7 @@ struct PartButton(Part);
 enum Readout {
     Bpm,
     Octave,
+    Temperature,
     Click,
     Info,
 }
@@ -300,6 +301,11 @@ fn setup_header(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
                 button("+", Command::Octave(1)),
             ]),
             (group(), children![
+                (label("temp 0.5"), Readout::Temperature, Node { width: px(86), ..default() }),
+                button("-", Command::Temperature(-0.1)),
+                button("+", Command::Temperature(0.1)),
+            ]),
+            (group(), children![
                 (
                     Button,
                     Action(Command::ToggleClick),
@@ -323,6 +329,8 @@ fn setup_header(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
                 part_button(Part::Ambient),
                 part_button(Part::Bass),
                 part_button(Part::Notes),
+                part_button(Part::Chords),
+                part_button(Part::Pad),
             ]),
             (
                 Button,
@@ -387,7 +395,13 @@ fn shortcuts(link: Res<Link>, keys: Res<ButtonInput<KeyCode>>, mut exit: Message
     if keys.just_pressed(KeyCode::BracketLeft) {
         send(Command::Octave(-1));
     }
-    for (k, part) in [(KeyCode::Digit1, Part::Ambient), (KeyCode::Digit2, Part::Bass), (KeyCode::Digit3, Part::Notes)] {
+    if keys.just_pressed(KeyCode::Period) {
+        send(Command::Temperature(0.1));
+    }
+    if keys.just_pressed(KeyCode::Comma) {
+        send(Command::Temperature(-0.1));
+    }
+    for (k, part) in [(KeyCode::Digit1, Part::Ambient), (KeyCode::Digit2, Part::Bass), (KeyCode::Digit3, Part::Notes), (KeyCode::Digit4, Part::Chords), (KeyCode::Digit5, Part::Pad)] {
         if keys.just_pressed(k) {
             send(Command::Part(part));
         }
@@ -597,8 +611,8 @@ fn update_part_buttons(link: Res<Link>, mut buttons: Query<(&PartButton, &mut Bo
     }
 }
 
-/// For testing: JAMSESH_SCREENSHOT=<path> presses BPM+ three times, octave+ once and "notes" (the same
-/// commands the buttons send), saves one frame after 12 s, then quits.
+/// For testing: JAMSESH_SCREENSHOT=<path> presses BPM+ three times, octave+ and temp+ once and "chords" (the same
+/// commands the buttons send), saves one frame after 12 s (or JAMSESH_SCREENSHOT_AT seconds), then quits.
 fn self_screenshot(
     mut commands: Commands,
     link: Res<Link>,
@@ -609,17 +623,18 @@ fn self_screenshot(
 ) {
     let Ok(path) = std::env::var("JAMSESH_SCREENSHOT") else { return };
     let t = time.elapsed_secs();
+    let at: f32 = std::env::var("JAMSESH_SCREENSHOT_AT").ok().and_then(|s| s.parse().ok()).unwrap_or(12.0);
     if t > 4.0 && !*pressed {
         *pressed = true;
-        for c in [Command::Bpm(2.0), Command::Bpm(2.0), Command::Bpm(2.0), Command::Octave(1), Command::Part(Part::Notes)] {
+        for c in [Command::Bpm(2.0), Command::Bpm(2.0), Command::Bpm(2.0), Command::Octave(1), Command::Temperature(0.1), Command::Part(Part::Chords)] {
             let _ = link.tx.send(c);
         }
     }
-    if t > 12.0 && !*done {
+    if t > at && !*done {
         *done = true;
         commands.spawn(Screenshot::primary_window()).observe(save_to_disk(path));
     }
-    if t > 14.0 {
+    if t > at + 2.0 {
         exit.write(AppExit::Success);
     }
 }
@@ -631,6 +646,7 @@ fn update_header(link: Res<Link>, mut readouts: Query<(&Readout, &mut Text)>) {
         let s = match readout {
             Readout::Bpm => format!("{bpm:.0} BPM"),
             Readout::Octave => format!("robot octave {:+}", viz.octave),
+            Readout::Temperature => format!("temp {:.1}", viz.temperature),
             Readout::Click => format!("click {}", if viz.click { "on" } else { "off" }),
             // The default font has no middle dot.
             Readout::Info => format!("{}  |  {}", viz.key, viz.status).replace('·', "|"),

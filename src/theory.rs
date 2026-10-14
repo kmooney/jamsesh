@@ -230,6 +230,21 @@ impl Chord {
         self.quality.intervals().iter().map(|i| (self.root + i) % 12).collect()
     }
 
+    /// Same root and basic triad, ignoring sixths, sevenths and added notes: Cmaj7, Cmaj9, C6
+    /// and C are one chord for following a progression, where melody notes over a held chord
+    /// keep changing its detected name.
+    pub fn same_family(self, other: Chord) -> bool {
+        let triad = |q: Quality| match q {
+            Quality::Maj | Quality::Maj6 | Quality::Dom7 | Quality::Maj7 | Quality::Add9 | Quality::Maj9 => 0,
+            Quality::Min | Quality::Min6 | Quality::Min7 | Quality::MinAdd9 | Quality::Min9 => 1,
+            Quality::Dim | Quality::HalfDim7 => 2,
+            Quality::Aug => 3,
+            Quality::Sus2 | Quality::Sus4 => 4,
+            Quality::Power => 5,
+        };
+        self.root == other.root && triad(self.quality) == triad(other.quality)
+    }
+
     /// Spread, open voicing starting at the first root at or above `low`:
     /// root, fifth, then third and seventh (or ninth) an octave up.
     pub fn open_voicing(self, low: u8) -> Vec<u8> {

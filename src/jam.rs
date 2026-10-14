@@ -9,6 +9,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
 use std::io::{Write as _, stdout};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -21,6 +22,7 @@ use crate::decide::{self, Context, Decision, Request, RobotStep, Role, Slot};
 use crate::jev::{Answers, Jev};
 use crate::listener::{Listener, Summary};
 use crate::midi_io::{Out, find_input, find_output};
+use crate::progression::Progression;
 use crate::render::{BarInput, Msg, Robot};
 use crate::rng::Rng;
 use crate::theory::{Key, Mode, rank_keys};
@@ -125,6 +127,9 @@ pub struct Shared {
     listener: Mutex<Listener>,
     clock: Mutex<Clock>,
     viz: Mutex<Viz>,
+    /// Note-ons heard from the human so far, so the jam loop can ask Jev again when there's
+    /// new input.
+    notes_heard: AtomicU64,
 }
 
 /// What the GUI reads.
@@ -154,6 +159,7 @@ fn handle_human(shared: &Shared, raw: &[u8]) {
     let data2 = raw.get(2).copied().unwrap_or(0);
     match raw[0] & 0xF0 {
         0x90 if data2 > 0 => {
+            shared.notes_heard.fetch_add(1, AtomicOrdering::Relaxed);
             l.note_on(raw[1], data2, beat);
             viz.note_on(Who::Human, raw[1], beat);
         }
@@ -168,6 +174,10 @@ fn handle_human(shared: &Shared, raw: &[u8]) {
 
 struct Pending {
     step: i64,
+    /// Which request this is for its step (1 = the first); later ones saw more of the human.
+    ask: u32,
+    /// Beat the request was sent on: it heard the human up to here.
+    sent: f64,
     /// Answers from before a part change are dropped.
     generation: u64,
     request: Request,
@@ -249,6 +259,7 @@ pub fn run(cfg: Config) -> Result<()> {
         // Start one bar early: that bar is the count-in.
         clock: Mutex::new(Clock { anchor: Instant::now(), anchor_beat: -bpb, bpm: cfg.bpm }),
         viz: Mutex::new(Viz::default()),
+        notes_heard: AtomicU64::new(0),
     });
 
     let mut midi_in = MidiInput::new("jamsesh")?;
@@ -269,7 +280,7 @@ pub fn run(cfg: Config) -> Result<()> {
         Err(e) => return Err(e),
     };
     say!("output: {out_name}  (you ch {}, robot ch {}, click ch {})", cfg.human_channel + 1, cfg.robot_channel + 1, cfg.click_channel + 1);
-    say!("robot:   {} (switch with 1 ambient, 2 bass, 3 notes)", cfg.part.name());
+    say!("robot:   {} (switch with 1 ambient, 2 bass, 3 notes, 4 chords, 5 pad)", cfg.part.name());
     say!("decider: {}", if cfg.mock { "mock (random)" } else { "Jev via OpenRouter" });
 
     let (cmd_tx, cmd_rx) = channel();
@@ -306,6 +317,8 @@ struct Session {
     keys: KeyTracker,
     /// The human's completed windows, by start beat.
     history: Vec<(f64, Summary)>,
+    /// The human's chord changes, beat by beat, over a longer span than `history`.
+    progression: Progression,
     /// What the robot played in each recent window, by start beat (so both line up even
     /// after the step length changes).
     robot_steps: Vec<(f64, RobotStep)>,
@@ -317,10 +330,23 @@ struct Session {
     switching: bool,
     /// The robot's latest melody note in notes mode (before octave shift).
     last_note: Option<u8>,
-    decisions: HashMap<i64, Decision>,
+    /// The latest decision's reading of the human, which the next one is smoothed with.
+    last_perception: Option<crate::respond::Perception>,
+    /// Per step: the newest answer so far (its ask number), the decision and the exchange for the panel.
+    decisions: HashMap<i64, (u32, Decision, crate::jev_view::Exchange)>,
     last_decision: Decision,
-    requested: i64,
+    /// The step requests are currently for, how many have been sent for it, and whether the
+    /// deadline request has gone out.
+    target: i64,
+    asks: u32,
+    deadline_sent: bool,
+    /// Requests on their way. New input while one is out sets `stale`, to ask again when it's back.
+    inflight: u32,
+    stale: bool,
+    notes_seen: u64,
+    /// Jev's round trip in seconds: running mean and mean deviation.
     latency_ema: f64,
+    latency_dev: f64,
     click: bool,
     beat_log: bool,
     octave: i32,
@@ -341,6 +367,7 @@ impl Session {
             let mut viz = shared.viz();
             viz.octave = cfg.octave;
             viz.click = cfg.click;
+            viz.temperature = cfg.temperature;
             viz.key = key.name();
             viz.part = Some(cfg.part);
         }
@@ -358,6 +385,7 @@ impl Session {
                 energy: 1.0,
                 slots: Vec::new(),
                 note: "start".into(),
+                perception: None,
             },
             cfg,
             shared,
@@ -369,14 +397,22 @@ impl Session {
             rng: Rng::from_time(),
             robot: Robot::default(),
             history: Vec::new(),
+            progression: Progression::default(),
             robot_steps: Vec::new(),
             pending_part: None,
             generation: 0,
             switching: false,
             last_note: None,
+            last_perception: None,
             decisions: HashMap::new(),
-            requested: -1,
-            latency_ema: 0.8,
+            target: -1,
+            asks: 0,
+            deadline_sent: false,
+            inflight: 0,
+            stale: false,
+            notes_seen: 0,
+            latency_ema: 0.3,
+            latency_dev: 0.1,
             jev_log,
         }
     }
@@ -412,7 +448,7 @@ impl Session {
                         match m {
                             Msg::On(n, _) => viz.note_on(Who::Robot, n, item.beat),
                             Msg::Off(n) if sounded => viz.note_off(Who::Robot, n, item.beat),
-                            Msg::Off(_) => {}
+                            Msg::Off(_) | Msg::Expression(_) => {}
                         }
                     }
                     Kind::Click(n, v) => self.shared.out.lock().unwrap().click(n, v),
@@ -426,8 +462,13 @@ impl Session {
 
             let beat = now.floor() as i64;
             if beat != current_beat {
-                if current_beat >= 0 && self.beat_log {
-                    self.log_beat(current_beat);
+                if current_beat >= 0 {
+                    let from = current_beat as f64;
+                    let chord = self.shared.listener.lock().unwrap().summarize(from, from + 1.0).chord;
+                    self.progression.hear(from, chord);
+                    if self.beat_log {
+                        self.log_beat(current_beat);
+                    }
                 }
                 current_beat = beat;
             }
@@ -440,7 +481,7 @@ impl Session {
                 }
                 self.start_bar(bar);
                 if let Some(part) = self.pending_part.take() {
-                    self.switch_part(part, bar);
+                    self.switch_part(part);
                     current_step = i64::MIN;
                 }
             }
@@ -452,13 +493,35 @@ impl Session {
                 self.start_step(step);
             }
 
-            // Ask Jev about the next step, early enough to hide its latency.
-            let beat_secs = 60.0 / self.shared.clock.lock().unwrap().bpm;
-            let lead = ((self.latency_ema * 1.5 + 0.1) / beat_secs).clamp(0.25, step_len * 0.75);
+            // Ask Jev about the next step as soon as it starts and again whenever the human plays
+            // something new (one of these at a time), then a last time as late as its answer can
+            // safely arrive, so the decision has heard as much of the human as possible. The
+            // newest answer that arrives before the step starts wins. Jev's round trip (about
+            // 0.15-0.35 s) is the floor: that much of the human is always unheard.
             let next_step = (step + 1) as f64 * step_len;
-            if now >= 0.0 && self.requested < step + 1 && now >= next_step - lead {
-                self.requested = step + 1;
-                self.request(step + 1, step as f64 * step_len, now);
+            if now >= 0.0 {
+                if self.target != step + 1 {
+                    self.target = step + 1;
+                    self.asks = 0;
+                    self.deadline_sent = false;
+                    self.stale = true;
+                }
+                let notes = self.shared.notes_heard.load(AtomicOrdering::Relaxed);
+                if notes != self.notes_seen {
+                    self.notes_seen = notes;
+                    self.stale = true;
+                }
+                let remaining = self.shared.clock.lock().unwrap().secs_until(next_step);
+                let safe = self.latency_ema + 2.0 * self.latency_dev + 0.03;
+                let last = !self.deadline_sent && remaining <= safe;
+                let early = self.stale && self.inflight == 0 && !self.deadline_sent && remaining > safe;
+                if last || early {
+                    self.deadline_sent |= last;
+                    self.stale = false;
+                    self.inflight += 1;
+                    self.asks += 1;
+                    self.request(step + 1, self.asks, step as f64 * step_len, now);
+                }
             }
 
             // Sleep until the next thing happens, but stay responsive to keys and input.
@@ -485,9 +548,13 @@ impl Session {
                 KeyCode::Char('c') => cmds.push(Command::ToggleClick),
                 KeyCode::Char('[') => cmds.push(Command::Octave(-1)),
                 KeyCode::Char(']') => cmds.push(Command::Octave(1)),
+                KeyCode::Char(',') => cmds.push(Command::Temperature(-0.1)),
+                KeyCode::Char('.') => cmds.push(Command::Temperature(0.1)),
                 KeyCode::Char('1') => cmds.push(Command::Part(decide::Part::Ambient)),
                 KeyCode::Char('2') => cmds.push(Command::Part(decide::Part::Bass)),
                 KeyCode::Char('3') => cmds.push(Command::Part(decide::Part::Notes)),
+                KeyCode::Char('4') => cmds.push(Command::Part(decide::Part::Chords)),
+                KeyCode::Char('5') => cmds.push(Command::Part(decide::Part::Pad)),
                 KeyCode::Char('b') => {
                     self.beat_log = !self.beat_log;
                     say!("beat lines {}", if self.beat_log { "on" } else { "off" });
@@ -518,6 +585,12 @@ impl Session {
                     self.shared.viz().octave = self.octave;
                     say!("robot octave {:+} (from the next step)", self.octave);
                 }
+                Command::Temperature(delta) => {
+                    // Round so repeated steps don't drift (0.1 isn't exact in binary).
+                    self.cfg.temperature = ((self.cfg.temperature + delta) * 10.0).round().clamp(0.0, 20.0) / 10.0;
+                    self.shared.viz().temperature = self.cfg.temperature;
+                    say!("temperature {:.1} (from the next decision)", self.cfg.temperature);
+                }
                 Command::Bpm(delta) => {
                     let mut clock = self.shared.clock.lock().unwrap();
                     let bpm = (clock.bpm + delta).clamp(30.0, 240.0);
@@ -531,18 +604,21 @@ impl Session {
 
     /// Change what the robot plays, at a bar line. The step grid may change with it, so
     /// pending decisions (made for the old part and grid) are thrown away.
-    fn switch_part(&mut self, part: decide::Part, bar: i64) {
+    fn switch_part(&mut self, part: decide::Part) {
         self.cfg.part = part;
         if !self.cfg.step_explicit {
             self.cfg.step_beats = part.default_step(self.cfg.beats_per_bar);
         }
         self.decisions.clear();
         self.generation += 1;
-        self.requested = ((bar as f64 * self.bpb()) / self.cfg.step_beats).floor() as i64;
+        // Start asking afresh for the new part's grid.
+        self.target = -1;
         self.switching = true;
         let mut viz = self.shared.viz();
         viz.part = Some(part);
         viz.pending_part = None;
+        // The confidence charts start over for the new part's questions.
+        viz.confidence.reset();
         drop(viz);
         say!("robot part: {} (deciding every {} beat(s))", part.name(), self.cfg.step_beats);
     }
@@ -590,7 +666,12 @@ impl Session {
         }
 
         let (decision, source) = match self.decisions.remove(&step) {
-            Some(d) => (d, ""),
+            Some((_, d, exchange)) => {
+                self.shared.viz().record(exchange);
+                // The next step's reading of the human is smoothed with the one being played.
+                self.last_perception = d.perception;
+                (d, "")
+            }
             None if step == 0 => (self.last_decision.clone(), ""),
             None if self.switching => {
                 let mut d = self.last_decision.clone();
@@ -641,12 +722,12 @@ impl Session {
         }
         let robot_label = match decision.role {
             Role::Rest => "rest".to_string(),
-            Role::Notes => format!("notes {}", decide::slots_label(&decision.slots, key)),
+            r @ (Role::Notes | Role::Chords) => format!("{} {}", r.key(), decide::slots_label(&decision.slots, key)),
             r => format!("{} {}", r.key(), decision.chord.name(key)),
         };
         self.robot_steps.push((
             start,
-            RobotStep { role: decision.role, notes: played, label: robot_label.clone() },
+            RobotStep { role: decision.role, notes: played },
         ));
         if self.robot_steps.len() > self.cfg.history + 2 {
             self.robot_steps.remove(0);
@@ -673,7 +754,7 @@ impl Session {
             decision.role.key(),
             match decision.role {
                 Role::Rest => String::new(),
-                Role::Notes => decide::slots_label(&decision.slots, key),
+                Role::Notes | Role::Chords => decide::slots_label(&decision.slots, key),
                 _ => decision.chord.name(key),
             },
             decision.energy,
@@ -724,7 +805,7 @@ impl Session {
         (mean(&pitch, 60.0), mean(&vel, 64.0))
     }
 
-    fn request(&mut self, for_step: i64, step_start: f64, now: f64) {
+    fn request(&mut self, for_step: i64, ask: u32, step_start: f64, now: f64) {
         let current = self.shared.listener.lock().unwrap().summarize(step_start, now);
         // Fold the step-in-progress into the key guess without committing it.
         let mut peek = self.keys.clone();
@@ -747,30 +828,36 @@ impl Session {
             last_note: self.last_note,
             human_center,
             part: self.cfg.part,
+            progression: &self.progression,
+            window_start: for_step as f64 * self.cfg.step_beats,
+            heard: now - step_start,
+            prior: self.last_perception,
         });
         let tx = self.tx.clone();
         let generation = self.generation;
         match &self.jev {
             None => {
-                let _ = tx.send(Pending { step: for_step, generation, request, result: Err(anyhow!("mock")) });
+                let _ = tx.send(Pending { step: for_step, ask, sent: now, generation, request, result: Err(anyhow!("mock")) });
             }
             Some(jev) => {
                 let jev = jev.clone();
                 thread::spawn(move || {
                     let result = jev.ask(&request.state, &request.questions);
-                    let _ = tx.send(Pending { step: for_step, generation, request, result });
+                    let _ = tx.send(Pending { step: for_step, ask, sent: now, generation, request, result });
                 });
             }
         }
     }
 
     fn receive(&mut self, p: Pending) {
+        self.inflight = self.inflight.saturating_sub(1);
         if p.generation != self.generation {
             return;
         }
         let answers = match &p.result {
             Ok(a) => {
                 let secs = a.latency.as_secs_f64();
+                self.latency_dev = self.latency_dev * 0.7 + (secs - self.latency_ema).abs() * 0.3;
                 self.latency_ema = self.latency_ema * 0.7 + secs * 0.3;
                 Some(a)
             }
@@ -785,16 +872,22 @@ impl Session {
             let line = serde_json::json!({ "step": p.step, "state": p.request.state, "response": a.raw });
             let _ = writeln!(log, "{line}");
         }
-        let mut d = decide::resolve(&p.request, answers, self.cfg.temperature, self.cfg.variety, &mut self.rng);
-        self.record_exchange(&p, answers, &d);
-        if let Some(a) = answers {
-            d.note = format!("{} · {:.2}s", d.note, a.latency.as_secs_f64());
+        // An older request answering late never replaces a newer one's decision.
+        if self.decisions.get(&p.step).is_some_and(|(ask, _, _)| *ask > p.ask) {
+            return;
         }
-        self.decisions.insert(p.step, d);
+        let mut d = decide::resolve(&p.request, answers, self.cfg.temperature, self.cfg.variety, &mut self.rng);
+        let exchange = self.exchange(&p, answers, &d);
+        if let Some(a) = answers {
+            // How much of the human it missed: from when it was sent to when its step starts.
+            let blind = p.step as f64 * self.cfg.step_beats - p.sent;
+            d.note = format!("{} · ask {}, {blind:.2} beats blind · {:.2}s", d.note, p.ask, a.latency.as_secs_f64());
+        }
+        self.decisions.insert(p.step, (p.ask, d, exchange));
     }
 
-    /// Keep the request and response for the GUI's brain panel.
-    fn record_exchange(&self, p: &Pending, answers: Option<&Answers>, d: &Decision) {
+    /// The request and response for the GUI's brain panel (recorded if its decision is played).
+    fn exchange(&self, p: &Pending, answers: Option<&Answers>, d: &Decision) -> crate::jev_view::Exchange {
         let key = self.keys.key;
         let beat = p.step as f64 * self.cfg.step_beats;
         let bpb = self.bpb();
@@ -806,11 +899,11 @@ impl Session {
         };
         let played = match d.role {
             Role::Rest => "rest".to_string(),
-            Role::Notes => format!("notes {}", decide::slots_label(&d.slots, key)),
+            r @ (Role::Notes | Role::Chords) => format!("{} {}", r.key(), decide::slots_label(&d.slots, key)),
             r => format!("{} on {}, energy {:.1}", r.key(), d.chord.name(key), d.energy),
         };
-        let e = crate::jev_view::Exchange {
-            title: format!("{position}  |  {}", self.cfg.part.name()),
+        crate::jev_view::Exchange {
+            title: format!("{position}  |  {}  |  ask {}", self.cfg.part.name(), p.ask),
             latency: answers.map(|a| a.latency.as_secs_f64()),
             state: p.request.state.clone(),
             questions: p.request.questions.iter().map(|(k, q)| (k.clone(), q.to_json())).collect(),
@@ -821,8 +914,7 @@ impl Session {
                 Ok(_) => None,
             },
             decision: format!("{played}   [{}]", d.note),
-        };
-        self.shared.viz().record(e);
+        }
     }
 
     /// A scripted human, for testing without a keyboard: slow ambient changes plus a sparse melody.

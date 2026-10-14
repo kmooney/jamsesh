@@ -1,5 +1,7 @@
 //! Turns one Jev request/response into readable, indented lines (no JSON punctuation) for
-//! the brain panel.
+//! the brain panel, and keeps Jev's probabilities over time for its confidence charts.
+
+use std::collections::VecDeque;
 
 use serde_json::Value;
 
@@ -53,7 +55,8 @@ pub fn lines(e: &Exchange) -> Vec<Line> {
     }
 
     out.push(line(0, Kind::Section, "RESULT", ""));
-    out.push(line(1, Kind::Text, &e.decision, ""));
+    // The default font has no middle dot.
+    out.push(line(1, Kind::Text, e.decision.replace('·', "|"), ""));
 
     if let Some(answers) = &e.answers {
         out.push(line(0, Kind::Section, "RESPONSE", ""));
@@ -104,7 +107,10 @@ fn answer_lines(out: &mut Vec<Line>, name: &str, a: &Value) {
             out.push(line(1, Kind::Field, pretty(name), format!("score {score:.2}{confidence}")));
             let legend = a.get("legend");
             let nearest = score.round() as i64;
-            for (level, p) in sorted_probs(a) {
+            // In level order, so rows stay put from one answer to the next.
+            let mut levels = sorted_probs(a);
+            levels.sort_by_key(|(level, _)| level.parse::<i64>().unwrap_or(i64::MAX));
+            for (level, p) in levels {
                 let text = legend.and_then(|l| l.get(&level)).map(scalar).unwrap_or_default();
                 let chosen = level.parse::<i64>().ok() == Some(nearest);
                 out.push(line(2, Kind::Prob(p, chosen), format!("{level}  {text}"), ""));
@@ -115,7 +121,10 @@ fn answer_lines(out: &mut Vec<Line>, name: &str, a: &Value) {
             out.push(line(1, Kind::Field, pretty(name), format!("{}{confidence}", pretty_option(choice))));
             let probs = sorted_probs(a);
             let shown = 8;
-            for (option, p) in probs.iter().take(shown) {
+            // The likeliest few, listed alphabetically so rows stay put from one answer to the next.
+            let mut top: Vec<_> = probs.iter().take(shown).collect();
+            top.sort_by_key(|(option, _)| pretty_option(option).to_lowercase());
+            for (option, p) in top {
                 out.push(line(2, Kind::Prob(*p, option == choice), pretty_option(option), ""));
             }
             if probs.len() > shown {
@@ -123,6 +132,123 @@ fn answer_lines(out: &mut Vec<Line>, name: &str, a: &Value) {
                 out.push(line(2, Kind::Text, format!("+{} more options, {:.0}% together", probs.len() - shown, rest * 100.0), ""));
             }
         }
+    }
+}
+
+/// Requests kept per chart.
+pub const POINTS: usize = 48;
+/// Distinct line colors; the panel supplies the actual colors.
+pub const PALETTE: usize = 10;
+/// Lines drawn per chart, most likely options first.
+const MAX_SERIES: usize = 8;
+
+/// Jev's probabilities over time, one chart per question, since the robot's part last changed.
+#[derive(Default)]
+pub struct History {
+    pub charts: Vec<Chart>,
+    /// Bumped on every change, so the panel knows when to redraw.
+    pub version: u64,
+}
+
+pub struct Chart {
+    pub name: String,
+    /// Each answer's probabilities by option label, oldest first.
+    pub points: VecDeque<Vec<(String, f64)>>,
+    /// Which option holds each palette color, so a line keeps its color while it's shown.
+    slots: [Option<String>; PALETTE],
+}
+
+/// One line on a chart.
+pub struct Series {
+    pub label: String,
+    pub color: usize,
+    /// Per point; None where the option wasn't offered.
+    pub values: Vec<Option<f64>>,
+}
+
+impl History {
+    pub fn reset(&mut self) {
+        self.charts.clear();
+        self.version += 1;
+    }
+
+    pub fn add(&mut self, e: &Exchange) {
+        let Some(answers) = &e.answers else { return };
+        for (name, _) in &e.questions {
+            let Some(a) = answers.get(name) else { continue };
+            let kind = a.get("type").and_then(Value::as_str);
+            let probs: Vec<(String, f64)> = match kind {
+                // A yes/no answer is one line: the chance of yes.
+                Some("noul") => a.get("noul").and_then(Value::as_f64).map(|p| vec![("yes".to_string(), p)]).unwrap_or_default(),
+                Some("score") => sorted_probs(a).into_iter().map(|(k, p)| (format!("level {k}"), p)).collect(),
+                _ => sorted_probs(a).into_iter().map(|(k, p)| (pretty_option(&k), p)).collect(),
+            };
+            if probs.is_empty() {
+                continue;
+            }
+            // Notes/chords modes ask one question per beat; they share a chart, beat after beat.
+            let group = match name.strip_prefix("beat_") {
+                Some(n) if n.parse::<u32>().is_ok() => "each beat".to_string(),
+                _ => pretty(name),
+            };
+            let i = match self.charts.iter().position(|c| c.name == group) {
+                Some(i) => i,
+                None => {
+                    self.charts.push(Chart { name: group, points: VecDeque::new(), slots: Default::default() });
+                    self.charts.len() - 1
+                }
+            };
+            let points = &mut self.charts[i].points;
+            points.push_back(probs);
+            while points.len() > POINTS {
+                points.pop_front();
+            }
+        }
+        self.version += 1;
+    }
+}
+
+impl Chart {
+    /// The options worth drawing (ever above 5% in view, at most MAX_SERIES by peak), in
+    /// alphabetical order, and how many others were left out.
+    pub fn series(&mut self) -> (Vec<Series>, usize) {
+        let mut peaks: Vec<(String, f64)> = Vec::new();
+        for point in &self.points {
+            for (label, p) in point {
+                match peaks.iter_mut().find(|(l, _)| l == label) {
+                    Some(peak) => peak.1 = peak.1.max(*p),
+                    None => peaks.push((label.clone(), *p)),
+                }
+            }
+        }
+        peaks.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let hidden = peaks.len().saturating_sub(MAX_SERIES) + peaks.iter().take(MAX_SERIES).filter(|(_, p)| *p < 0.05).count();
+        let mut shown: Vec<String> = peaks.into_iter().take(MAX_SERIES).filter(|(_, p)| *p >= 0.05).map(|(l, _)| l).collect();
+        // Alphabetical, so the legend doesn't reshuffle as probabilities move.
+        shown.sort_by_key(|l| l.to_lowercase());
+
+        // Free the colors of lines no longer shown, then give new lines a free one.
+        for slot in &mut self.slots {
+            if slot.as_ref().is_some_and(|l| !shown.contains(l)) {
+                *slot = None;
+            }
+        }
+        let series = shown
+            .into_iter()
+            .map(|label| {
+                let color = match self.slots.iter().position(|s| s.as_ref() == Some(&label)) {
+                    Some(c) => c,
+                    None => {
+                        let c = self.slots.iter().position(Option::is_none).unwrap_or(0);
+                        self.slots[c] = Some(label.clone());
+                        c
+                    }
+                };
+                let values = self.points.iter().map(|pt| pt.iter().find(|(l, _)| *l == label).map(|(_, p)| *p)).collect();
+                Series { label, color, values }
+            })
+            .collect();
+        (series, hidden)
     }
 }
 
@@ -258,5 +384,51 @@ mod tests {
         assert!(joined.contains("notes: B4"));
         assert!(joined.contains("E4 (note)"));
         assert!(ls.iter().any(|l| l.kind == Kind::Prob(0.6, true) && l.key == "hold"));
+    }
+
+    fn answered(probs: &[(&str, f64)]) -> Exchange {
+        let p: serde_json::Map<String, Value> = probs.iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
+        Exchange {
+            title: String::new(),
+            latency: None,
+            state: json!({}),
+            questions: vec![("beat_1".into(), json!({})), ("energy".into(), json!({}))],
+            answers: Some(json!({
+                "beat_1": { "type": "choice", "choice": probs[0].0, "probabilities": p },
+                "energy": { "type": "score", "score": 1.2, "probabilities": { "0": 0.2, "1": 0.8 } },
+            })),
+            error: None,
+            decision: String::new(),
+        }
+    }
+
+    #[test]
+    fn history_keeps_one_line_per_option_with_stable_colors() {
+        let mut h = History::default();
+        h.add(&answered(&[("chord_Am7", 0.7), ("hold", 0.3)]));
+        h.add(&answered(&[("chord_Fmaj7", 0.6), ("chord_Am7", 0.4)]));
+        assert_eq!(h.charts.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["each beat", "energy"]);
+
+        let (series, hidden) = h.charts[0].series();
+        assert_eq!(hidden, 0);
+        let am = series.iter().find(|s| s.label == "Am7 (chord)").unwrap();
+        assert_eq!(am.values, [Some(0.7), Some(0.4)]);
+        let hold = series.iter().find(|s| s.label == "hold").unwrap();
+        assert_eq!(hold.values, [Some(0.3), None], "not offered the second time");
+        let am_color = am.color;
+
+        // A new leader doesn't take an existing line's color.
+        h.add(&answered(&[("chord_G7", 0.9), ("chord_Am7", 0.1)]));
+        let (series, _) = h.charts[0].series();
+        assert_eq!(series.iter().find(|s| s.label == "Am7 (chord)").unwrap().color, am_color);
+        let colors: std::collections::HashSet<_> = series.iter().map(|s| s.color).collect();
+        assert_eq!(colors.len(), series.len());
+
+        let labels: Vec<String> = series.iter().map(|s| s.label.clone()).collect();
+        assert_eq!(labels, ["Am7 (chord)", "Fmaj7 (chord)", "G7 (chord)", "hold"], "alphabetical");
+        let levels: Vec<String> = h.charts[1].series().0.into_iter().map(|s| s.label).collect();
+        assert_eq!(levels, ["level 0", "level 1"]);
+        h.reset();
+        assert!(h.charts.is_empty());
     }
 }

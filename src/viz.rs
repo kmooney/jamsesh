@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 
 use crate::decide::Part;
-use crate::jev_view::Exchange;
+use crate::jev_view::{Exchange, History};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Who {
@@ -35,6 +35,7 @@ pub struct Viz {
     pub key: String,
     pub octave: i32,
     pub click: bool,
+    pub temperature: f64,
     pub part: Option<Part>,
     /// A part change waiting for the next bar line.
     pub pending_part: Option<Part>,
@@ -44,6 +45,8 @@ pub struct Viz {
     pub exchanges: VecDeque<Exchange>,
     /// Total exchanges ever recorded, so the GUI can tell when a new one arrives.
     pub exchange_count: u64,
+    /// Jev's probabilities over time since the part last changed.
+    pub confidence: History,
 }
 
 impl Viz {
@@ -73,6 +76,7 @@ impl Viz {
     }
 
     pub fn record(&mut self, e: Exchange) {
+        self.confidence.add(&e);
         self.exchanges.push_back(e);
         while self.exchanges.len() > 40 {
             self.exchanges.pop_front();
@@ -92,6 +96,7 @@ impl Viz {
 pub enum Command {
     Bpm(f64),
     Octave(i32),
+    Temperature(f64),
     ToggleClick,
     Part(Part),
     Quit,
